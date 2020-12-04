@@ -1,2 +1,113 @@
 # avocado
 avocado-imputation edited scripts for our own usage and ease of implementation with our own data. 
+
+
+#These are step by step instructions. this is NOT a submittable script. it will, however, provide instructions to generate those submittable scripts. 
+
+
+
+#in order to actually embed our files into the model, you NEED to be using the theano backend for keras. this sounds crazy but is super easy to change. 
+#go to your parent directory, and edit the ~/.keras/keras.json file. there will be a line that says "    "backend": "xxxxx"; just change the "xxxxx" (whatever it currently says) to "theano" (just use nano to edit the file). then run the provided scripts normally!
+
+#to run all listed .py scripts, can scp -r the .py files to your own avocado directory, or just call them using my path to the scripts: /home/CAM/ewentworth/cotney/analysis/avocado/
+
+
+#######NEED TO GENERATE AN AVOCADO CHROM SIZES FILE. USES THE NORMAL CHROM SIZES/25 (FOR 25 BP RESOLUTION). 
+
+awk '{print $1, (int($2/25))}' /home/CAM/ewentworth/cotney/genome/hg19/hg19.chrom.sizes | egrep -v "_|M|Y" > /home/CAM/ewentworth/cotney/genome/hg19/hg19.chrom.sizes.avocado
+
+##be sure you use a LOT of memory, or tensorflow will dump and avocado won't even load. 
+#!!!!!CUDA ERROR IS NOT A PROBLEM, WE ARENT USING A GPU. 
+#!!!!!!!!!DO NOT MODULE LOAD AVOCADO EVEN FOR COMMAND LINE!!!!!!!!!!!!!!!!
+
+
+source /home/FCAM/jcotney/.bashrc_miniconda3
+conda activate avocado2
+export CHROMSIZES=/home/CAM/ewentworth/cotney/genome/hg19/hg19.chrom.sizes
+export MODEL=/home/CAM/ewentworth/cotney/analysis/avocado/model
+export AVOCADO=/home/CAM/ewentworth/cotney/analysis/avocado
+cd $AVOCADO
+
+
+#first download their model, if you don't have it yet
+sed 's/href="/\t/g' index.html | sed 's/.h5"/.h5\t/g' | sed 's/.json"/.json\t/g' | cut -f2 | egrep -hi "h5|json" | awk '{print "wget https://noble.gs.washington.edu/proj/avocado/model/"$0}'
+
+#then make a file which contails a tab file with the experiments and cell types.
+#ex:
+#cs22_11865_face	H3K27ac
+#cs22_11865_face	H3K36me3
+#etc. 
+ls CS*.bigWig cs*.bigWig | sed 's/.pval.signal.bigWig//g' | sed 's/_H3K4me1//g' | sed 's/_H3K27ac//g' | sed 's/_H3K27me3//g' | sed 's/_redo//g' | sed 's/_combined//g' | awk '!seen[$0]++' > samples.txt
+
+#copy all *nonimputed* bigwig files into a directory called "BigWigs"
+
+#now we make bedgraphs per chr of each sample which will be converted to npz arrays
+
+cd BigWigs
+echo -e "#/bin/bash\n#SBATCH --mail-type=END\n#SBATCH --mail-user=wentworth@uchc.edu\n#SBATCH -c 8\n#SBATCH -N 1\n#SBATCH -n 1\n#SBATCH --job-name=bw2bg\n#SBATCH --partition=himem\n#SBATCH --qos=himem\n#SBATCH --mem=248G\n#SBATCH -o %j.out\n#SBATCH -e %j.err\nsource /home/FCAM/jcotney/.bashrc_miniconda3\nconda activate avocado2\ncd /home/CAM/ewentworth/cotney/analysis/avocado/BigWigs\nmodule load kent-tools" | sed 's/\/bin/!\/bin/g' > ../1_bigWigToBedGraph.sh
+
+for i in {1..22}, X
+do
+for sample in *.bigWig
+do
+export NAME=`echo $sample | sed 's/.pval.signal.bigWig//g'`
+echo $sample | awk '{print "bigWigToBedGraph -chrom=chr""'$i'", $0, "'$NAME'"".chr""'$i'"".bedGraph "}' | sed 's/\t/ /g' | sed 's/,//g' >> ../1_bigWigToBedGraph.sh
+done
+done
+cd ../
+echo -e "conda deactivate\n" >> 1_bigWigToBedGraph.sh
+sbatch 1_bigWigToBedGraph.sh
+
+
+#after this runs, make those numpy arrays
+#the script to make npz arrays per chromosome is "convert_perchr_bedgraphs_to_npz.py". it's been modified to run command line, and these few lines generate a script to run this command line for each sample/chromosome in a slurm script. 
+#if using hg38 or another genome, just use -c /path/to/chromsize/divided/by/25/generated/above; default is hg19 chrom sizes in my genome directory for hg19.
+ 
+cd BigWigs/
+for bigwig in cs*.bigWig CS*.bigWig
+do
+export assay=`echo $bigwig | sed 's/.pval.signal.bigWig//g'`
+echo $assay $bigwig | sed 's/ /\t/g' > ../PerChrBedGraphs/$assay-nonimputed_assay_list.txt
+echo $assay $bigwig | sed 's/ /\t/g' | sed 's/_H/\tH/g' | cut -f1,2 > $MODEL/$assay-nonimputed_assay_list_2.txt
+echo -e "#/bin/bash\n#SBATCH --mail-type=END\n#SBATCH --mail-user=wentworth@uchc.edu\n#SBATCH -c 4\n#SBATCH -N 1\n#SBATCH -n 1\n#SBATCH --job-name=$assay\n#SBATCH --partition=himem\n#SBATCH --qos=himem\n#SBATCH --mem=248G\n#SBATCH -o %j.out\n#SBATCH -e %j.err\nsource /home/FCAM/jcotney/.bashrc_miniconda3\nconda activate avocado2\ncd $AVOCADO/PerChrBedGraphs\npython ../convert_perchr_bedgraphs_to_npz.py -f $assay-nonimputed_assay_list.txt\nconda deactivate\n" | sed 's/\/bin/!\/bin/g' > $AVOCADO/2_$assay-to_npz.sh
+sbatch $AVOCADO/2_$assay-to_npz.sh
+done
+
+#move npz arrays to the model directory to integrate the two
+for sample in *.npz
+do
+mv $sample $MODEL/$sample
+done
+
+#now we integrate these npz into the roadmap model, bc we are going to use the roadmap samples for our imputation. need to move the npz files into the directory with the model first
+
+echo -e "#/bin/bash\n#SBATCH --mail-type=END\n#SBATCH --mail-user=wentworth@uchc.edu\n#SBATCH -c 8\n#SBATCH -N 1\n#SBATCH -n 1\n#SBATCH --job-name=addtomodel\n#SBATCH --partition=himem\n#SBATCH --qos=himem\n#SBATCH --mem=248G\n#SBATCH -o %j.out\n#SBATCH -e %j.err\nsource /home/FCAM/jcotney/.bashrc_miniconda3\nconda activate avocado2\ncd $MODEL" | sed 's/\/bin/!\/bin/g' > add_to_model_roadmap.sh
+for sample in $MODEL/*-nonimputed_assay_list_2.txt
+do
+echo -e "python /home/CAM/ewentworth/cotney/analysis/avocado/add_to_model_roadmap.py -f $sample\n" >> add_to_model_roadmap.sh
+done
+echo -e "conda deactivate\n" >> add_to_model_roadmap.sh
+sbatch add_to_model_roadmap.sh
+
+
+
+#finally it's time to impute after adding new samples to the model!!
+#so here we go:
+#marks file contains a list of all the marks we'll be imputing
+#sample file contains a list of all samples we want to impute
+
+
+for mark in $(cat marks.txt)
+do
+echo $mark
+for sample in $(cat samples.txt)
+do
+echo $sample 
+echo $sample | awk '{print $0, "'$mark'", $0"_'$mark'.pval.signal.bigWig"}' | sed 's/ /\t/g'>> assay_list.txt
+done
+done
+
+echo -e "#/bin/bash\n#SBATCH --mail-type=END\n#SBATCH --mail-user=wentworth@uchc.edu\n#SBATCH -c 8\n#SBATCH -N 1\n#SBATCH -n 1\n#SBATCH --job-name=addtomodel\n#SBATCH --partition=himem\n#SBATCH --qos=himem\n#SBATCH --mem=248G\n#SBATCH -o %j.out\n#SBATCH -e %j.err\nsource /home/FCAM/jcotney/.bashrc_miniconda3\nconda activate avocado2\navocado-impute -f assay_list.txt -s $CHROMSIZES -p model -v\nconda deactivate" | sed 's/\/bin/!\/bin/g' > 4_final_imputation.sh
+sbatch 4_final_imputation.sh
+
+
